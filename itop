@@ -1,0 +1,101 @@
+#!/bin/bash
+#James Q Wang first coding 30/6/20
+#copy all files to your folder ~/itop/
+#then run: ~/itop/itop
+
+#similar function as innotop - which uses perl and overhead can trigger mysqld crashing
+#innotop issues:
+# 1. overhead and could trigger OOM
+# 2. it does not quit when a user ssh session timed out
+
+if [[ -z "$1" ]]; then 
+    echo "please input optionally pid (see full details and explain plan)"
+fi
+echo CPUs $(nproc)
+sleep 2
+sq=""
+fold=$HOME/expl
+if [[ ! -d $fold ]]; then mkdir $fold; fi
+qp="select sys_id,sys_updated_on,average,format(count,0) as count,left(example,96) from sys_pattern inner join sys_query_pattern using(sys_id) where sys_updated_on > date_sub(now(), interval 3 day) and average>2 order by sys_updated_on desc limit 10 "
+#if don't want to show query_pattern: it is slow if too many slow quries
+ qp=
+if [[ -z "$PORT" ]]; then 
+    echo "please do: . itop/.port instance"
+    exit
+fi
+
+sf=$fold/st.txt
+$HOME/itop/q "show engine innodb status\G" >  $sf
+$HOME/itop/q "show full processlist\G"     >> $sf
+cp $sf $sf.old
+cp $sf $sf.$(date '+%m%d%H')
+if [[ -z "$1" ]]; then 
+    loop=0
+    while true; do
+        f=$fold/q$(echo "scale=0;$(date +%M)/10"|bc).txt
+        $HOME/itop/q "select processlist_id as pid, processlist_user as puser,left(PROCESSLIST_HOST, 16) as phost, processlist_command as cmd,processlist_time as time, left(processlist_state,16) as state, left(replace(sql_text,'\n', ' '),76) as info from  performance_schema.threads inner join performance_schema.events_statements_current esc using(thread_id) where esc.end_event_id is null and processlist_user not like 'repl%' order by time desc limit 30; select count(1) as total_conn from performance_schema.threads\Gselect count(1) as activ_conn from performance_schema.threads where processlist_command!='Sleep'\Gshow slave status\Gshow master status\G$qp" > $f
+        #if pid is null, type = background
+        if [[ 0 -eq ${loop} ]]; then cp $f $f.$(date +%m%d%H); fi
+        head -n 28 $f
+        grep _conn $f
+        grep "Seconds_Behind_Master" $f
+        w |head -n 1
+        echo -e "                CPU     %user     %nice   %system   %iowait    %steal     %idle" 
+        sar -u|tail -n 2 #only see /dev/sda? needs iostat -kx -xm (better and in MB)
+        iostat -xm |tail -n 6| tee $sf.ios.$(date '+%H')
+        echo "swapping..."
+        sar -W|tail -n 2
+        #vmstat 1 3
+        #TRANSACTIONS
+        grep "History list len" $sf.old
+        #more from 
+        grep "Free buffers" $sf.old|head -n 1
+        echo "dirty page: $(grep 'Modified db pages' $sf.old|head -n 1)"
+        grep "Pending reads"  $sf.old|head -n 1
+        grep "Pending writes" $sf.old|head -n 1
+        grep "Buffer pool hit rate" $sf.old|head -n 1
+        #SEMAPHORES
+        grep "has waited at.*semaphore" $sf.old|head -n 1
+        #rep "innodb_undo_space_used" $sf #mariadb no such
+        if [[ -f $sf.old ]] && [[ -n $(find $sf.old -cmin +1) ]]; then
+            #so you can see innodb engine status difference
+            $HOME/itop/q "show engine innodb status\G" > $sf
+            #leep 9
+            mv $sf $sf.old
+        fi
+        if [[ -n "$qp" ]]; then
+            tail -n 13 $f
+        fi
+        loop=$(($loop + 1))
+        sleep 9
+        clear
+    done
+else
+    #just killed the long insert query (which deadlock to sort out marriott issue INT4776754)
+    if   [[ "lock"   == "$1" ]]; then
+        q="SELECT pl.id ,pl.user ,pl.state ,it.trx_id ,it.trx_mysql_thread_id ,it.trx_query AS query ,it.trx_id AS blocking_trx_id ,it.trx_mysql_thread_id AS blocking_thread ,it.trx_query AS blocking_query FROM information_schema.processlist AS pl INNER JOIN information_schema.innodb_trx AS it ON pl.id = it.trx_mysql_thread_id INNER JOIN information_schema.innodb_lock_waits AS ilw ON it.trx_id = ilw.requesting_trx_id AND it.trx_id = ilw.blocking_trx_id"
+        $HOME/itop/q "$q\G" >> ~/expl/status$(date +%Y%m%d%H%M).sql
+    elif [[ "slave" == "$1" ]] || [[ "lag" == "$1" ]]; then
+        $HOME/itop/q "select tid, user,left(HOST, 8) as host, command as cmd,time as time, left(state,16) as state, left(replace(info,'\n', ' '),90) as info from  information_schema.processlist where command!='Slave_IO' and command !='Binlog Dump' and command!='Slave_SQL' order by time desc limit 20"
+    elif [[ "status" == "$1" ]]; then
+        $HOME/itop/q "show engine innodb status\G" > ~/expl/status$(date +%Y%m%d%H%M).sql
+    else
+        if [[ ${1} -lt 10 ]]; then
+            #grab id from $fold/q[0-9].txt to get query quickly 28/7/20
+            file=$(ls -t $fold/q[0-9].txt|head -n 1)
+            id=$(cat $file|grep "^| [0-9]"|head -n $1|tail -n 1|sed -e 's:^| \([0-9]\{1,\}\).*:\1:g')
+        else
+            id=$1
+        fi 
+        if [[ ! -d ~/sql ]]; then mkdir ~/sql; fi
+        $HOME/itop/q "select info from  information_schema.processlist where id=$id"|grep -v info|grep -v '^\+' |awk -F'|' '{print $2}' |tee ~/sql/$id.sql
+        echo see ~/sql/$id.sql
+        echo if query too long, p-s.threads, i-s.processlist and app node localhost log all truncate, use the following
+        echo to show full query: $HOME/itop/q \"show full processlist\" \|grep $1
+        echo to kill: pbrun snow m $PORT -e \"kill $1\"
+    fi
+fi
+echo "the following any use?
+perf record -a -g -F99 -p $(pidof mysqld) -- sleep 60
+perf report > perf.out
+"
