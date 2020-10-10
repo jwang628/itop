@@ -1,4 +1,4 @@
-# itop
+# itop - similar to innotop but less overhead
 
 copy all files to your folder $HOME/itop/
 
